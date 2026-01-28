@@ -1,0 +1,23 @@
+{
+  "categories": [
+    {
+      "name": "💬-general",
+      "channels": [
+        { "name": "general", "type": "text" },
+        { "name": "off-topic", "type": "text" }
+      ]
+    },
+    {
+      "name": "🔊-voice",
+      "channels": [
+        { "name": "General", "type": "voice" }
+      ]
+    }
+  ],
+  "roles": [
+    {
+      "name": "Member",
+      "color": "Blue"
+    }
+  ]
+}
