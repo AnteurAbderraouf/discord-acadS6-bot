@@ -1,33 +1,43 @@
-// index.js
-require('dotenv').config();
+// index.js — student verification bot.
+//
+// A student posts their matricule in #matricule. If it is in the roster
+// (listeoptions.xlsx, read-only) they get the "spe" and "Student" roles.
+// Otherwise they get an explanatory reply. Runs on every server the bot is in.
+require('dotenv').config({ quiet: true });
+
 const fs = require('fs');
 const path = require('path');
 const { Client, GatewayIntentBits } = require('discord.js');
-const { findStudentSectionP, findStudentAffectation } = require('./excel');
+const { findStudent, rosterSize } = require('./excel');
 
-const USED_IDS_PATH = path.join(__dirname, 'used-ids.json');
-const CYBER_LOGS_PATH = path.join(__dirname, 'cyber-verif-logs.json');
+const LOG_PATH = path.join(__dirname, 'used-ids.json');
 
-// IDs des serveurs
-const GUILD_ID_1 = '1451338534467141765'; // serveur 1 (section A / B)
-const GUILD_ID_2 = '1451573366833025210'; // serveur 2 (Cyber / Autres)
+// Channel the bot listens in (exact name, no '#').
+const VERIF_CHANNEL = 'matricule';
 
-// Charger used-ids.json (log global)
-let usedIds = [];
+// Roles granted on a successful verification, in order.
+const ROLES_TO_ADD = ['spe', 'Student'];
+
+// A matricule is 8-15 digits. Anything else is treated as ordinary chatter
+// and ignored, so normal conversation in the channel is not answered.
+const MATRICULE_RE = /^\d{8,15}$/;
+
+// ---------- verification log (append-only) ----------
+let verifLog = [];
 try {
-  usedIds = JSON.parse(fs.readFileSync(USED_IDS_PATH, 'utf8'));
-  if (!Array.isArray(usedIds)) usedIds = [];
+  const parsed = JSON.parse(fs.readFileSync(LOG_PATH, 'utf8'));
+  if (Array.isArray(parsed)) verifLog = parsed;
 } catch (err) {
-  usedIds = [];
+  verifLog = []; // missing or empty file on first run
 }
 
-// Charger cyber-verif-logs.json (log serveur 2)
-let cyberLogs = [];
-try {
-  cyberLogs = JSON.parse(fs.readFileSync(CYBER_LOGS_PATH, 'utf8'));
-  if (!Array.isArray(cyberLogs)) cyberLogs = [];
-} catch (err) {
-  cyberLogs = [];
+function appendLog(entry) {
+  verifLog.push(entry);
+  try {
+    fs.writeFileSync(LOG_PATH, JSON.stringify(verifLog, null, 2));
+  } catch (err) {
+    console.error('[log] Écriture de used-ids.json impossible:', err.message);
+  }
 }
 
 const client = new Client({
@@ -39,128 +49,129 @@ const client = new Client({
   ]
 });
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`Connecté en tant que ${client.user.tag}`);
+  console.log(`Roster: ${rosterSize()} matricules.`);
+  console.log(`Serveurs (${client.guilds.cache.size}):`);
+  for (const [, g] of client.guilds.cache) {
+    console.log(`  - ${g.name} [${g.id}]`);
+  }
+  console.log(`En écoute dans #${VERIF_CHANNEL} sur chaque serveur.`);
 });
 
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
-  if (message.channel.name !== 'verification') return;
+  if (message.channel.name !== VERIF_CHANNEL) return;
 
-  const matricule = message.content.trim();
-  if (!matricule) return;
+  const content = message.content.trim();
+  if (!content) return;
 
-  // Log global dans used-ids.json (les deux serveurs)
-  usedIds.push({
-    id: matricule,
-    userId: message.author.id,
-    username: `${message.author.username}#${message.author.discriminator}`,
-    guildId: message.guild.id,
-    timestamp: new Date().toISOString()
-  });
-  try {
-    fs.writeFileSync(USED_IDS_PATH, JSON.stringify(usedIds, null, 2));
-  } catch (err) {
-    console.error('Erreur lors de l\'écriture de used-ids.json:', err);
+  const where = `${message.guild.name}/#${message.channel.name}`;
+
+  if (!MATRICULE_RE.test(content)) {
+    console.log(`[${where}] Ignoré (pas un matricule): "${content.slice(0, 40)}"`);
+    return;
   }
 
-  // Dispatcher selon le serveur
-  if (message.guild.id === GUILD_ID_1) {
-    await handleServer1(message, matricule);
-  } else if (message.guild.id === GUILD_ID_2) {
-    await handleServer2(message, matricule);
+  const student = findStudent(content);
+
+  // ----- not a student -----
+  if (!student) {
+    console.log(`[${where}] ${content} -> INTROUVABLE`);
+    appendLog({
+      matricule: content,
+      userId: message.author.id,
+      username: message.author.tag,
+      guildId: message.guild.id,
+      guildName: message.guild.name,
+      result: 'not_found',
+      timestamp: new Date().toISOString()
+    });
+    await message.reply(
+      "❌ This ID is not in the student list. Check your matricule and try again — " +
+      "if you are sure it is correct, contact an admin."
+    ).catch(() => {});
+    return;
+  }
+
+  // ----- verified student: assign roles -----
+  const roles = await message.guild.roles.fetch().catch(() => null);
+  if (!roles) {
+    console.error(`[${where}] Impossible de lire les rôles.`);
+    await message.reply("⚠️ I can't read the roles on this server. Please tell an admin.").catch(() => {});
+    return;
+  }
+
+  const me = await message.guild.members.fetchMe();
+  const found = [];
+  const missing = [];
+  const tooHigh = [];
+
+  for (const name of ROLES_TO_ADD) {
+    const role = roles.find(r => r.name === name);
+    if (!role) missing.push(name);
+    else if (role.position >= me.roles.highest.position) tooHigh.push(name);
+    else found.push(role);
+  }
+
+  if (missing.length || tooHigh.length) {
+    const problems = [
+      missing.length ? `missing: ${missing.join(', ')}` : null,
+      tooHigh.length ? `above my own role: ${tooHigh.join(', ')}` : null
+    ].filter(Boolean).join(' | ');
+    console.error(`[${where}] Problème de rôles -> ${problems}`);
+  }
+
+  let added = [];
+  if (found.length) {
+    try {
+      const member = await message.guild.members.fetch(message.author.id);
+      await member.roles.add(found);
+      added = found.map(r => r.name);
+    } catch (err) {
+      console.error(`[${where}] Ajout de rôle échoué:`, err.message);
+      await message.reply(
+        "⚠️ You are verified, but I could not give you the role (permissions). Please tell an admin."
+      ).catch(() => {});
+      appendLog({
+        matricule: student.matricule,
+        name: student.name,
+        userId: message.author.id,
+        username: message.author.tag,
+        guildId: message.guild.id,
+        guildName: message.guild.name,
+        result: 'role_error',
+        error: err.message,
+        timestamp: new Date().toISOString()
+      });
+      return;
+    }
+  }
+
+  console.log(`[${where}] ${content} -> OK (${student.name}) rôles: ${added.join(', ') || 'aucun'}`);
+  appendLog({
+    matricule: student.matricule,
+    name: student.name,
+    userId: message.author.id,
+    username: message.author.tag,
+    guildId: message.guild.id,
+    guildName: message.guild.name,
+    result: 'verified',
+    rolesAdded: added,
+    rolesMissing: missing,
+    timestamp: new Date().toISOString()
+  });
+
+  if (added.length) {
+    await message.reply(`✅ Verified — welcome **${student.name}**! You now have: ${added.join(', ')}.`).catch(() => {});
+  } else {
+    await message.reply(
+      `✅ Verified — welcome **${student.name}**! But the roles I should give (${ROLES_TO_ADD.join(', ')}) are not usable here. Please tell an admin.`
+    ).catch(() => {});
   }
 });
 
-// ---------- Logique serveur 1 ----------
-async function handleServer1(message, matricule) {
-  const sectionP = findStudentSectionP(matricule);
-  console.log('[Srv1] Matricule reçu:', matricule, '→ SectionP trouvée:', sectionP);
-
-  if (sectionP === null) {
-    await message.reply("ID doesn't exist, check your ID and try again l3ziz.");
-    return;
-  }
-
-  const roleSectionA = message.guild.roles.cache.find(r => r.name === 'section A');
-  const roleSectionB = message.guild.roles.cache.find(r => r.name === 'section B / other option');
-  const roleDouane  = message.guild.roles.cache.find(r => r.name === 'La douane');
-
-  if (!roleSectionA || !roleSectionB) {
-    await message.reply("Les rôles `section A` ou `section B / other option` n'existent pas sur ce serveur.");
-    return;
-  }
-
-  const member = await message.guild.members.fetch(message.author.id);
-  await member.roles.remove([roleSectionA, roleSectionB]).catch(() => {});
-
-  if (sectionP === 'A') {
-    console.log('[Srv1] Case: SectionP === A -> section A');
-    await member.roles.add(roleSectionA);
-    if (roleDouane) await member.roles.remove(roleDouane);
-    await message.reply("You are welcome to **section A** l3ziz.");
-  } else {
-    console.log('[Srv1] Case: SectionP !== A -> section B');
-    await member.roles.add(roleSectionB);
-    if (roleDouane) await member.roles.remove(roleDouane);
-    await message.reply("You have been added to **section B / other option**, you are welcome here l3ziz.");
-  }
-}
-
-// ---------- Logique serveur 2 ----------
-async function handleServer2(message, matricule) {
-  const affect = findStudentAffectation(matricule);
-  console.log('[Srv2] Matricule reçu:', matricule, '→ Affectation trouvée:', affect);
-
-  if (affect === null) {
-    await message.reply("ID doesn't exist, check your ID and try again.");
-    return;
-  }
-
-  const roleCyber    = message.guild.roles.cache.find(r => r.name === 'Cyber');
-  const roleAutres   = message.guild.roles.cache.find(r => r.name === 'Autre option');
-  const roleNonVerif = message.guild.roles.cache.find(r => r.name === 'Non-vérifié → ❌');
-
-  if (!roleCyber || !roleAutres) {
-    await message.reply("Les rôles `Cyber` ou `Autres` n'existent pas sur ce serveur.");
-    return;
-  }
-
-  const member = await message.guild.members.fetch(message.author.id);
-  await member.roles.remove([roleCyber, roleAutres]).catch(() => {});
-
-  const targetAffect = "Sécurité Informatique  -  Administration Clients/Serveurs";
-
-  let resultRole = 'Autres';
-
-  if (affect === targetAffect) {
-    console.log('[Srv2] Case: Affectation = Sécurité -> Cyber');
-    await member.roles.add(roleCyber);
-    resultRole = 'Cyber';
-    if (roleNonVerif) await member.roles.remove(roleNonVerif);
-    await message.reply("You have been added to **Cyber**.");
-  } else {
-    console.log('[Srv2] Case: Affectation != Sécurité -> Autres');
-    await member.roles.add(roleAutres);
-    if (roleNonVerif) await member.roles.remove(roleNonVerif);
-    await message.reply("You have been added to **Autres**.");
-  }
-
-  // Log spécifique serveur 2 dans cyber-verif-logs.json
-  cyberLogs.push({
-    id: matricule,
-    userId: message.author.id,
-    username: `${message.author.username}#${message.author.discriminator}`,
-    affectation: affect,
-    assignedRole: resultRole,
-    timestamp: new Date().toISOString()
-  });
-
-  try {
-    fs.writeFileSync(CYBER_LOGS_PATH, JSON.stringify(cyberLogs, null, 2));
-  } catch (err) {
-    console.error('Erreur lors de l\'écriture de cyber-verif-logs.json:', err);
-  }
-}
+client.on('error', (err) => console.error('[client error]', err.message));
+process.on('unhandledRejection', (err) => console.error('[unhandledRejection]', err));
 
 client.login(process.env.TOKEN);

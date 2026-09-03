@@ -8,3 +8,8 @@ node_modules/
 # Logs / debug
 *.log
 npm-debug.log*
+
+# Verification logs - contain student names, matricules and Discord IDs.
+# Kept locally, never committed.
+used-ids.json
+cyber-verif-logs.json
